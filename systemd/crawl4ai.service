@@ -1,0 +1,20 @@
+[Unit]
+Description=Crawl4AI Web — lokale Crawl-Station
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crawl4ai-web
+ExecStart=/opt/crawl4ai-web/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=PORT=8000
+Environment=CRAWL4AI_DATA_DIR=/var/lib/crawl4ai
+# Optional: Environment=CRAWL4AI_PASSWORD=dein-passwort
+EnvironmentFile=-/etc/crawl4ai-web.env
+
+[Install]
+WantedBy=multi-user.target
