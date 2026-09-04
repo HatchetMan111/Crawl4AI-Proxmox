@@ -31,8 +31,42 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "crawls.db"
 APP_PASSWORD = os.environ.get("CRAWL4AI_PASSWORD", "")
 
-# Einfache In-Memory Sessions (reicht für lokalen LXC; nach Reboot neu login)
-SESSIONS: set[str] = set()
+# ---------- Auth (stateless, signierte Cookies — überleben Reboots) ----------
+COOKIE_NAME = "crawl4ai_session"
+SESSION_DAYS = 30
+
+
+def is_protected() -> bool:
+    return bool(APP_PASSWORD)
+
+
+def _session_secret() -> bytes:
+    # Aus dem Passwort abgeleitet: kein Server-State nötig,
+    # Sessions überleben Container-Reboots und Service-Restarts.
+    return hashlib.sha256(f"crawl4ai-web|{APP_PASSWORD}".encode()).digest()
+
+
+def _sign_session(token: str) -> str:
+    sig = hmac.new(_session_secret(), token.encode(), hashlib.sha256).hexdigest()
+    return f"{token}.{sig}"
+
+
+def check_auth(session: Optional[str]) -> bool:
+    if not is_protected():
+        return True
+    if not session or "." not in session:
+        return False
+    token, _, sig = session.rpartition(".")
+    if not token or not sig:
+        return False
+    expected = hmac.new(_session_secret(), token.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+def require_auth(session: Optional[str]):
+    if not check_auth(session):
+        raise HTTPException(status_code=401, detail="Sitzung abgelaufen — bitte neu anmelden")
+
 
 app = FastAPI(title=APP_NAME)
 
@@ -57,22 +91,6 @@ def db() -> sqlite3.Connection:
     )
     con.commit()
     return con
-
-
-# ---------- Auth ----------
-def is_protected() -> bool:
-    return bool(APP_PASSWORD)
-
-
-def check_auth(session: Optional[str]) -> bool:
-    if not is_protected():
-        return True
-    return bool(session) and session in SESSIONS
-
-
-def require_auth(session: Optional[str]):
-    if not check_auth(session):
-        raise HTTPException(status_code=401, detail="Login erforderlich")
 
 
 # ---------- Models ----------
@@ -166,6 +184,11 @@ def config():
     return {"protected": is_protected(), "app": APP_NAME}
 
 
+@app.get("/api/me")
+def me(session: Optional[str] = Cookie(default=None, alias="crawl4ai_session")):
+    return {"protected": is_protected(), "authed": check_auth(session), "app": APP_NAME}
+
+
 @app.post("/api/login")
 async def login(req: Request, resp: Response):
     if not is_protected():
@@ -176,17 +199,19 @@ async def login(req: Request, resp: Response):
         body = {}
     pw = str(body.get("password", ""))
     if hmac.compare_digest(pw, APP_PASSWORD):
-        tok = secrets.token_hex(24)
-        SESSIONS.add(tok)
-        resp.set_cookie("crawl4ai_session", tok, httponly=True, samesite="lax", path="/")
+        tok = _sign_session(secrets.token_hex(24))
+        resp.set_cookie(
+            COOKIE_NAME, tok, httponly=True, samesite="lax", path="/",
+            max_age=SESSION_DAYS * 86400,
+        )
         return {"ok": True}
     raise HTTPException(status_code=401, detail="Falsches Passwort")
 
 
 @app.post("/api/logout")
-def logout(session: Optional[str] = Cookie(default=None, alias="crawl4ai_session")):
-    if session and session in SESSIONS:
-        SESSIONS.discard(session)
+def logout(resp: Response):
+    # Stateless-Session: serverseitig nichts zu löschen — Cookie beim Client entfernen.
+    resp.delete_cookie(COOKIE_NAME, path="/")
     return {"ok": True}
 
 
@@ -328,13 +353,21 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0d1320;border:1px sol
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
 a{color:var(--acc)}.mut{color:var(--mut);font-size:13px}.ok{color:var(--ok)}.err{color:var(--err)}
 #login{display:none}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--mut);margin-right:6px;vertical-align:baseline}
+.dot.on{background:var(--ok)}.dot.off{background:var(--err)}
+#toasts{position:fixed;top:12px;right:12px;display:grid;gap:8px;z-index:50;max-width:min(420px,90vw)}
+.toast{background:#0d1320;border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:8px;padding:10px 14px;font-size:13px;box-shadow:0 4px 18px rgba(0,0,0,.4)}
+.toast.ok{border-left-color:var(--ok)}.toast.err{border-left-color:var(--err)}
+.spin{display:inline-block;animation:rot 1s linear infinite}@keyframes rot{to{transform:rotate(360deg)}}
+.hidden{display:none!important}
 </style></head><body>
-<header><h1>🕷️ Crawl4AI Web</h1><span class="tag">lokal · LXC · Port 8000</span><span class="tag" id="authTag">…</span>
-<span style="flex:1"></span><button class="ghost" id="logoutBtn" style="display:none">Logout</button></header>
+<header><h1>🕷️ Crawl4AI Web</h1><span class="tag">lokal · LXC · Port 8000</span><span class="tag"><span class="dot" id="healthDot"></span><span id="healthTxt">verbinde …</span></span><span class="tag" id="authTag">…</span>
+<span style="flex:1"></span><button class="ghost hidden" id="logoutBtn">Abmelden</button></header>
+<div id="toasts"></div>
 <main>
-<div class="card" id="login"><h3 style="margin-top:0">🔐 Login</h3>
-<p class="mut">Diese Instanz ist passwortgeschützt. Passwort eingeben (beim Install-Script gesetzt).</p>
-<div class="row"><input type="password" id="pw" placeholder="Passwort"><button onclick="doLogin()">Anmelden</button></div>
+<div class="card" id="login"><h3 style="margin-top:0">🔐 Anmelden</h3>
+<p class="mut">Diese Instanz ist passwortgeschützt. Nach der Anmeldung bleibst du eingeloggt — auch über Container-Neustarts hinweg.</p>
+<div class="row"><input type="password" id="pw" placeholder="Passwort" autocomplete="current-password"><button id="loginBtn" onclick="doLogin()">Anmelden</button></div>
 <p class="err" id="loginErr"></p></div>
 <div class="card"><h3 style="margin-top:0">+ Neue Seite crawlen</h3>
 <label>URL (z. B. https://example.com)</label>
@@ -353,18 +386,74 @@ a{color:var(--acc)}.mut{color:var(--mut);font-size:13px}.ok{color:var(--ok)}.err
 <tbody id="list"></tbody></table></div>
 </main>
 <script>
-let lastId=null, authed=true;
-async function api(p,o={}){const r=await fetch(p,{credentials:'same-origin',...o});if(r.status===401){authed=false;showLogin();throw new Error('Login erforderlich');}return r;}
-function showLogin(){document.getElementById('login').style.display='block';document.getElementById('authTag').textContent='🔒 geschützt';document.getElementById('logoutBtn').style.display='inline-block';}
-async function init(){const c=await (await fetch('/api/config')).json();authed=!c.protected;if(c.protected){const t=await fetch('/api/crawls',{credentials:'same-origin'});if(t.status===401){showLogin();}else{document.getElementById('authTag').textContent='🔓 eingeloggt';document.getElementById('logoutBtn').style.display='inline-block';loadList();}}else{document.getElementById('authTag').textContent='offen (kein Login)';loadList();}}
-async function doLogin(){const pw=document.getElementById('pw').value;const r=await fetch('/api/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){location.reload();}else{document.getElementById('loginErr').textContent='Falsches Passwort';}}
-document.getElementById('logoutBtn').onclick=async()=>{await fetch('/api/logout',{method:'POST',credentials:'same-origin'});location.reload();};
-async function doCrawl(){const b=document.getElementById('go'),s=document.getElementById('status');b.disabled=true;s.textContent='⏳ Crawle … (Browser startet, kann 10–60s dauern)';try{const r=await api('/api/crawl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.getElementById('url').value,mode:document.getElementById('mode').value,word_threshold:parseInt(document.getElementById('wt').value)})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.statusText);lastId=j.id;document.getElementById('out').textContent=j.markdown||'(leer)';document.getElementById('meta').textContent=`#${j.id} · ${j.markdown_len} Zeichen · ${j.duration_ms} ms · ${j.title||''}`;s.innerHTML='<span class="ok">✓ fertig (#'+j.id+')</span>';loadList();}catch(e){s.innerHTML='<span class="err">✗ '+String(e.message||e).slice(0,2000)+'</span>';}b.disabled=false;}
-async function loadList(){try{const r=await api('/api/crawls?limit=50');const j=await r.json();document.getElementById('list').innerHTML=j.crawls.map(c=>`<tr><td>${c.id}</td><td><a href="${c.url}" target="_blank">${c.url.slice(0,60)}</a><br><span class="mut">${(c.title||'').slice(0,80)}</span></td><td>${c.mode}</td><td>${c.status==='ok'?'<span class="ok">ok</span>':'<span class="err">error</span>'}</td><td class="mut">${c.md_len||0} Z. · ${c.duration_ms} ms<br>${c.created_at||''}</td><td><button class="ghost" onclick="view(${c.id})">Ansehen</button> <button class="ghost" onclick="del(${c.id})">🗑</button></td></tr>`).join('')||'<tr><td colspan=6 class=mut>leer</td></tr>';}catch(e){}}
-async function view(id){const r=await api('/api/crawls/'+id);const j=await r.json();lastId=id;document.getElementById('out').textContent=j.markdown||j.html||j.error||'(leer)';document.getElementById('meta').textContent=`#${j.id} · ${j.url}`;window.scrollTo({top:0,behavior:'smooth'});}
-async function del(id){if(!confirm('Eintrag #'+id+' löschen?'))return;await api('/api/crawls/'+id,{method:'DELETE'});loadList();}
-function dl(){if(!lastId)return alert('Erst crawlen');window.location='/api/crawls/'+lastId+'/markdown';}
-function copyMd(){navigator.clipboard.writeText(document.getElementById('out').textContent);}
+let lastId=null;
+const $=id=>document.getElementById(id);
+function toast(msg,kind=''){const t=document.createElement('div');t.className='toast '+kind;t.textContent=msg;$('toasts').appendChild(t);setTimeout(()=>t.remove(),kind==='err'?9000:4500);}
+function setAuthed(on,label){$('authTag').textContent=label;$('login').style.display=on?'none':'block';$('logoutBtn').classList.toggle('hidden',!on||label.startsWith('offen'));}
+async function api(p,o={}){
+  let r;
+  try{r=await fetch(p,{credentials:'same-origin',...o});}
+  catch(e){throw new Error('Server nicht erreichbar ('+p+'): '+e.message);}
+  if(r.status===401){setAuthed(false,'🔒 Sitzung abgelaufen');toast('Sitzung abgelaufen — bitte neu anmelden.','err');throw new Error('Sitzung abgelaufen — bitte neu anmelden.');}
+  return r;
+}
+async function health(auto=false){
+  try{const r=await fetch('/api/health');const j=await r.json();
+    if(j.status==='ok'){$('healthDot').className='dot on';$('healthTxt').textContent='Server online';return true;}
+    throw new Error('unbekannt');
+  }catch(e){$('healthDot').className='dot off';$('healthTxt').textContent='Server offline';if(!auto)toast('Server nicht erreichbar: '+e.message,'err');return false;}
+}
+async function init(){
+  $('pw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+  $('url').addEventListener('keydown',e=>{if(e.key==='Enter')doCrawl();});
+  $('logoutBtn').onclick=doLogout;
+  if(!await health(true)){$('authTag').textContent='⚠ offline';setTimeout(init,5000);return;}
+  try{
+    const me=await (await api('/api/me')).json();
+    if(!me.protected){setAuthed(true,'offen (kein Login)');await loadList();}
+    else if(me.authed){setAuthed(true,'🔓 eingeloggt');$('loginErr').textContent='';await loadList();}
+    else{setAuthed(false,'🔒 geschützt');}
+  }catch(e){/* api() meldet bereits via toast */}
+  setInterval(()=>health(true),15000);
+}
+async function doLogin(){
+  const b=$('loginBtn');b.disabled=true;$('loginErr').textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('pw').value})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error((j.detail||'Anmeldung fehlgeschlagen')+' (HTTP '+r.status+')');
+    $('pw').value='';setAuthed(true,'🔓 eingeloggt');toast('✓ Erfolgreich angemeldet.');
+    await loadList();
+  }catch(e){$('loginErr').textContent='✗ '+e.message;toast('Anmeldung fehlgeschlagen: '+e.message,'err');}
+  b.disabled=false;
+}
+async function doLogout(){try{await fetch('/api/logout',{method:'POST',credentials:'same-origin'});}catch(e){}setAuthed(false,'🔒 geschützt');toast('Abgemeldet.');}
+async function doCrawl(){
+  const b=$('go'),s=$('status');b.disabled=true;
+  const t0=Date.now(),tick=setInterval(()=>{s.innerHTML='<span class="mut"><span class="spin">⏳</span> Crawle … '+Math.round((Date.now()-t0)/1000)+'s (Browser startet, kann 10–60s dauern)</span>';},500);
+  s.innerHTML='<span class="mut"><span class="spin">⏳</span> Crawle …</span>';
+  try{
+    const r=await api('/api/crawl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value,mode:$('mode').value,word_threshold:parseInt($('wt').value)})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error((typeof j.detail==='string'?j.detail:r.statusText||('HTTP '+r.status)));
+    lastId=j.id;$('out').textContent=j.markdown||'(leer — Seite lieferte keinen Text)';
+    $('meta').textContent=`#${j.id} · ${j.markdown_len} Zeichen · ${j.duration_ms} ms · ${j.title||''}`;
+    s.innerHTML='<span class="ok">✓ fertig (#'+j.id+')</span>';toast('✓ Crawl #'+j.id+' fertig ('+j.markdown_len+' Zeichen).');
+    await loadList();
+  }catch(e){clearInterval(tick);s.innerHTML='<span class="err">✗ '+String(e.message||e).slice(0,2000)+'</span>';$('out').textContent='Fehler:\n'+String(e.message||e).slice(0,4000);toast('Crawl fehlgeschlagen: '+String(e.message||e).slice(0,300),'err');}
+  finally{clearInterval(tick);b.disabled=false;}
+}
+async function loadList(){
+  try{
+    const r=await api('/api/crawls?limit=50');const j=await r.json();
+    $('list').innerHTML=j.crawls.map(c=>`<tr><td>${c.id}</td><td><a href="${c.url}" target="_blank" rel="noopener">${esc(c.url).slice(0,60)}</a><br><span class="mut">${esc(c.title||'').slice(0,80)}</span></td><td>${c.mode}</td><td>${c.status==='ok'?'<span class="ok">ok</span>':'<span class="err">error</span>'}</td><td class="mut">${c.md_len||0} Z. · ${c.duration_ms} ms<br>${esc(c.created_at||'')}</td><td><button class="ghost" onclick="view(${c.id})">Ansehen</button> <button class="ghost" onclick="del(${c.id})">🗑</button></td></tr>`).join('')||'<tr><td colspan=6 class=mut>leer — noch nichts gecrawlt</td></tr>';
+  }catch(e){$('list').innerHTML='<tr><td colspan=6 class=err>Verlauf lädt nicht: '+esc(String(e.message||e)).slice(0,300)+'</td></tr>';toast('Verlauf lädt nicht: '+String(e.message||e).slice(0,300),'err');}
+}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function view(id){try{const r=await api('/api/crawls/'+id);const j=await r.json();if(!r.ok)throw new Error(j.detail||('HTTP '+r.status));lastId=id;$('out').textContent=j.markdown||j.html||j.error||'(leer)';$('meta').textContent=`#${j.id} · ${j.url}`;window.scrollTo({top:0,behavior:'smooth'});}catch(e){toast('Eintrag lädt nicht: '+e.message,'err');}}
+async function del(id){if(!confirm('Eintrag #'+id+' löschen?'))return;try{const r=await api('/api/crawls/'+id,{method:'DELETE'});if(!r.ok)throw new Error('HTTP '+r.status);toast('Eintrag #'+id+' gelöscht.');await loadList();}catch(e){toast('Löschen fehlgeschlagen: '+e.message,'err');}}
+function dl(){if(!lastId){toast('Erst crawlen oder einen Verlaufseintrag ansehen.','err');return;}window.location='/api/crawls/'+lastId+'/markdown';}
+async function copyMd(){try{await navigator.clipboard.writeText($('out').textContent);toast('✓ In Zwischenablage kopiert.');}catch(e){toast('Kopieren fehlgeschlagen: '+e.message,'err');}}
 init();
 </script></body></html>"""
 
