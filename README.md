@@ -6,6 +6,24 @@ Läuft **vollständig lokal** im LXC, keine Cloud nötig. Upstream: https://gith
 **Visuelle Oberfläche:** URL-Feld + Modus (Markdown / Fit / HTML) → Crawlen → Ergebnis + Verlauf (SQLite).
 **Login:** optional — beim Installieren Passwort setzen oder leer lassen (offen im Heimnetz).
 
+## 🎯 Use Cases — wofür ist das gut?
+
+Crawl4AI macht aus jeder Webseite **sauberes, LLM-ready Markdown**. Die Web-UI legt noch Bulk-Crawl,
+Verlauf mit Suche und Statistiken drauf. Typische Anwendungen:
+
+| Use Case | Wie |
+|---|---|
+| **🤖 RAG / Wissensdatenbank füttern** | Dokus, Handbücher, Wikis per Bulk crawlen → Markdown laden → in NotebookLM, AnythingLLM, Open WebUI oder eigene Vektor-DB importieren |
+| **📚 Recherche & Lesearchiv** | Artikel/Quellen sammeln, im Verlauf suchen, als `.md` ablegen — lesbar ohne Cookie-Banner und Tracking |
+| **💰 Preis- & Angebotsbeobachtung** | Produktseiten regelmäßig per **↻ Retry** neu crawlen und Versionen vergleichen |
+| **📝 Docs offline verfügbar machen** | API-Dokus und Anleitungen als Markdown sichern (z. B. vor Offline-Phasen oder Paywalls) |
+| **🔍 SEO- / Content-Audit** | Mehrere eigene Seiten auf einmal crawlen (Fit-Markdown = KI-bereinigt) und Inhalte prüfen |
+| **📰 Monitoring / Change-Detection** | Wichtige Seiten per Retry neu holen; Fehler landen getrennt im Verlauf (`nur Fehler`-Filter) |
+| **🧹 Webseiten entmüllen** | Fit-Modus entfernt Navigation/Werbung — übrig bleibt der eigentliche Inhalt |
+
+Tipp: **Bulk-Feld** (eine URL pro Zeile) für Listen, **Suche + Statusfilter** im Verlauf zum Wiederfinden,
+**Tabs Markdown/HTML/Fehler** in der Ergebnisansicht je nach Bedarf.
+
 ## 🚀 Einzeiler (auf dem Proxmox-Host als root)
 
 ```bash
@@ -34,6 +52,14 @@ Erwartete Endausgabe:
 ```
 
 Danach: Browser öffnen → URL eintragen → **Crawlen**.
+
+## 🖥️ Web-UI im Überblick
+
+- **📊 Übersicht:** Zähler für Crawls gesamt / erfolgreich / fehlerhaft / Zeichen + letzter Crawl
+- **+ Crawlen:** einzelne URL (Enter genügt) oder **📦 Bulk** mit mehreren URLs (eine pro Zeile, mit Fortschrittsbalken)
+- **📄 Ergebnis:** Tabs **Markdown / HTML / Fehler-Info**, dazu Laden, Kopieren und **↻ Erneut crawlen**
+- **🗂 Verlauf:** Live-**Suche** in URL/Titel, **Statusfilter** (alle / nur erfolgreich / nur Fehler), Ansehen, Retry, Löschen, **Alle löschen**
+- **🔐 Sitzungen** überleben Container-Reboots (signierte Cookies, 30 Tage); bei Ablauf meldet sich die UI von selbst
 
 ## 📦 Was installiert wird
 
